@@ -1,8 +1,11 @@
+import uuid
+
 from flask import Blueprint, request, url_for, flash, redirect
 from flask import render_template
-from flaskext.login import login_user, logout_user
-from flaskext.wtf import Form, TextField, PasswordField, validators
+from flask.ext.login import login_user, logout_user
+from flask.ext.wtf import Form, TextField, TextAreaField, PasswordField, validators, ValidationError
 
+from bibserver.config import config
 import bibserver.dao as dao
 
 blueprint = Blueprint('account', __name__)
@@ -27,12 +30,12 @@ def login():
         if user and user.check_password(password):
             login_user(user, remember=True)
             flash('Welcome back', 'success')
-            return redirect(url_for('home'))
+            return redirect('/'+user.id)
         else:
-            flash('Incorrect email/password', 'error')
+            flash('Incorrect username/password', 'error')
     if request.method == 'POST' and not form.validate():
         flash('Invalid form', 'error')
-    return render_template('account/login.html', form=form)
+    return render_template('account/login.html', form=form, upload=config['allow_upload'])
 
 
 @blueprint.route('/logout')
@@ -42,26 +45,38 @@ def logout():
     return redirect(url_for('home'))
 
 
+def existscheck(form, field):
+    test = dao.Account.get(form.w.data)
+    if test:
+        raise ValidationError('Taken! Please try another.')
+
 class RegisterForm(Form):
-    username = TextField('Username', [validators.Length(min=3, max=25)])
-    email = TextField('Email Address', [validators.Length(min=3, max=35)])
-    password = PasswordField('New Password', [
+    w = TextField('Username', [validators.Length(min=3, max=25),existscheck])
+    n = TextField('Email Address', [validators.Length(min=3, max=35), validators.Email(message='Must be a valid email address')])
+    s = PasswordField('Password', [
         validators.Required(),
-        validators.EqualTo('confirm', message='Passwords must match')
+        validators.EqualTo('c', message='Passwords must match')
     ])
-    confirm = PasswordField('Repeat Password')
+    c = PasswordField('Repeat Password')
+    d = TextAreaField('Describe yourself')
 
 @blueprint.route('/register', methods=['GET', 'POST'])
 def register():
     # TODO: re-enable csrf
     form = RegisterForm(request.form, csrf_enabled=False)
     if request.method == 'POST' and form.validate():
-        account = dao.Account(id=form.username.data, email=form.email.data)
-        account.set_password(form.password.data)
+        api_key = str(uuid.uuid4())
+        account = dao.Account(
+            _id=form.w.data, 
+            email=form.n.data,
+            description = form.d.data,
+            api_key=api_key
+        )
+        account.set_password(form.s.data)
         account.save()
         login_user(account, remember=True)
         flash('Thanks for signing-up', 'success')
-        return redirect(url_for('home'))
+        return redirect('/'+account.id)
     if request.method == 'POST' and not form.validate():
         flash('Please correct the errors', 'error')
     return render_template('account/register.html', form=form)

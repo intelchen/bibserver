@@ -1,198 +1,86 @@
 # the data import manager
 # gets an uploaded file or retrieves a file from a URL
-# Uses the parser manager to parse the file
 # indexes the records found in the file by upserting via the DAO
-
 import urllib2
 import re
 from cStringIO import StringIO
 import unicodedata
+import uuid
+import json
 
-from bibserver.parser import Parser
 import bibserver.dao
+import bibserver.util as util
+from bibserver.config import config
 
 class Importer(object):
-    def upload(self, pkg):
-        '''upload content and index it'''
-        
-        if "upfile" in pkg:
-            pkg["fileobj"] = pkg["upfile"]
-        elif "data" in pkg:
-            pkg["fileobj"] = StringIO(pkg['data'])
-        elif "source" in pkg:
-            pkg["fileobj"] = urllib2.urlopen( pkg["source"] )
+    def __init__(self, owner, requesturl=False):
+        self.owner = owner
+        self.requesturl = requesturl
 
-        return self.index(pkg)
+    def upload(self, fileobj, collection=None):
+        '''Import a bibjson collection into the database.
+       
+        :param fileobj: a fileobj pointing to file from which to import
+        collection records (and possibly collection metadata)
+        :param collection: collection dict for use when creating collection. If
+        undefined collection must be extractable from the fileobj.
 
-    
-    def bulk_upload(self, colls_list):
-        '''upload a list of collections from provided file locations
-        colls_list looks like the pkg, so should have source for a URL, 
-        or upfile for a local file'''
-#        try:
-        for coll in colls_list["collections"]:
-            self.upload(coll)
-        return True
-#        except:
-#            return False
-    
-    
-    # index the content
-    def index(self, pkg):
-        '''index a file'''
-        parser = Parser()
-        data = parser.parse(pkg["fileobj"], pkg["format"])
-
-        # prepare the data as required
-        data, pkg = self.prepare(data,pkg)
-        
-        # if allowed to index, then index (match source or email)
-        if self.can_index(pkg):
-            # delete any old versions
-            # should change this to do checks first, and save new ones, perhaps
-            try:
-                if "collection" in pkg:
-                    bibserver.dao.Record.delete_by_query("collection.exact:" + pkg["collection"])
-                if "source" in pkg:
-                    res = bibserver.dao.Record.query(q='source:"' + pkg["source"] + '" AND type:"collection"')
-                    if res["hits"]["total"] != 0:
-                        coll = res["hits"]["hits"][0]["_source"]["collection"]
-                    else:
-                        coll = ""
-                    if coll != pkg.get("collection",None):
-                        bibserver.dao.Record.delete_by_query("collection.exact:" + coll)
-            except:
-                pass
-            # send the data list for bulk upsert
-            return bibserver.dao.Record.bulk_upsert(data)
-        else:
-            return "DUPLICATE"
-
-
-    def can_index(self,pkg):
-        '''check if a pre-existing collection of same name exists.
-        If so, only allow re-index if either source or email match.
+        :return: same as `index` method.
         '''
-        try:
-            res = bibserver.dao.Record.query(q='collection:' + pkg["collection"] + ' AND type:collection')
-            if "source" in res["hits"]["hits"][0]["_source"]:
-                if pkg["source"] == res["hits"]["hits"][0]["_source"]["source"]:
-                    return True
-                else:
-                    return False
-            elif "email" in res["hits"]["hits"][0]["_source"]:
-                if pkg["email"] == res["hits"]["hits"][0]["_source"]["email"]:
-                    return True
-                else:
-                    return False
-            else:
-                return False
-        except:
-            return True
+        jsonin = json.load(fileobj)
+        metadata = jsonin.get('metadata',False)
+        record_dicts = jsonin.get('records', jsonin)
 
-
-    # prepare the data in various ways
-    def prepare(self,data,pkg):
-    
-        # replace white space in collection name with _
-        if "collection" in pkg:
-            pkg["collection"] = pkg["collection"].replace(" ","_")
-    
-        # if no collection name provided, build a collection name if possible
-        if "collection" not in pkg:
-            # build collection name from source URL
-            if "source" in pkg:
-                derived_name = pkg["source"].replace("http://","").replace("https://","").replace("/","").replace(".","").replace("~","")
-                pkg["collection"] = derived_name
-                #pkg["collection"] = pkg["source"]
-
-            # build collection name from source URL
-            elif "email" in pkg and pkg["email"] is not None:
-                derived_name = pkg["email"].replace("@","").replace(".","")
-                pkg["collection"] = derived_name
-
+        # if metadata provided from file, roll it into the collection object
+        if metadata:
+            metadata.update(collection)
+            collection = metadata
         
-        for index,item in enumerate(data):
-            
-            # if collection name provided, check it is in each record, or add it if not
-            if "collection" in pkg:
-                if "collection" in data[index]:
-                    if isinstance('List',data[index]["collection"]):
-                        data[index]["collection"] = data[index]["collection"].append(pkg["collection"])
-                    elif isinstance('String',data[index]["collection"]):
-                        data[index]["collection"] = [data[index]["collection"],pkg["collection"]]
-                    else:
-                        data[index]["collection"] = pkg["collection"]
-                else:
-                    data[index]["collection"] = pkg["collection"]
+        return self.index(collection, record_dicts)
+    
+    def index(self, collection_dict, record_dicts):
+        '''Add this collection and its records to the database index.
+        :return: (collection, records) tuple of collection and associated
+        record objects.
+        '''
+        col_label_slug = util.slugify(collection_dict['label'])
+        collection = bibserver.dao.Collection.get_by_owner_coll(self.owner.id, col_label_slug)
+        if not collection:
+            collection = bibserver.dao.Collection(**collection_dict)
+            assert 'label' in collection, 'Collection must have a label'
+            if not 'collection' in collection:
+                collection['collection'] = col_label_slug
+            collection['owner'] = self.owner.id
+
+        collection.save()
+
+        for rec in record_dicts:
+            if not type(rec) is dict: continue
+            rec['owner'] = collection['owner']
+            if 'collection' in rec:
+                if collection['collection'] != rec['collection']:
+                    rec['collection'] = collection['collection']
             else:
-                # if no package collection name, try to find one in the provided records
-                if "collection" in data[index]:
-                    pkg["collection"] = data[index]["collection"]
-            
-            # look for people records
-            #data[index] = self.parse_people(data[index])
+                rec['collection'] = collection['collection']
+            if not self.requesturl and 'SITE_URL' in config:
+                self.requesturl = str(config['SITE_URL'])
+            if self.requesturl:
+                if not self.requesturl.endswith('/'):
+                    self.requesturl += '/'
+                if '_id' not in rec:
+                    rec['_id'] = bibserver.dao.make_id(rec)
+                rec['url'] = self.requesturl + collection['owner'] + '/' + collection['collection'] + '/'
+                if 'id' in rec:
+                    rec['url'] += rec['id']
+                elif '_id' in rec:
+                    rec['url'] += rec['_id']
+        bibserver.dao.Record.bulk_upsert(record_dicts)
+        return collection, record_dicts
 
-        # add the package info to the collection
-        pkg["type"] = "collection"
-        metadata = pkg
-        if "data" in metadata:
-            del metadata["data"]
-        if "fileobj" in metadata:
-            del metadata["fileobj"]
-        if "upfile" in metadata:
-            del metadata["upfile"]
-        data.insert(0,metadata)
-        
-        return data, pkg
-
-
-    # parse potential people out of a record
-    # check if they have a person record in bibsoup
-    # if not create one
-    # append person IDs to a person attribute of every record
-    def parse_people(self,record):
-        if "person" not in record:
-            record["person"] = []
-        if "author" in record:
-            record["person"].extend(self.do_people(record["author"]))
-        if "advisor" in record:
-            record["person"].extend(self.do_people(record["advisor"]))
-        if "editor" in record:
-            record["person"].extend(self.do_people(record["editor"]))
-        return record
-    
-    def do_people(self,people):
-        persons = []
-        if isinstance(people,str):
-            persons = self.do_person(people)
-        if isinstance(people,list):
-            for person in people:
-                persons.append(self.do_person(person))
-        return persons
-    
-    def do_person(self,person_string):
-        try:
-            results = bibserver.dao.Record.query(q='type.exact:"person" AND alias.exact:"' + person_string + '"')
-            if results["hits"]["total"] != 0:
-                return results["hits"]["hits"][0]["_source"]["person"]
-
-            looseresults = bibserver.dao.Record.query(q='type.exact:"person" AND "*' + person_string + '*"',flt=True,fields=["person"])
-            if looseresults["hits"]["total"] != 0:
-                tid = looseresults["hits"]["hits"][0]["_id"]
-                data = bibserver.dao.Record.get(tid)
-                if "alias" in data:
-                    if person_string not in data["alias"]:
-                        data["alias"].append(person_string)
-                bibserver.dao.Record.upsert(data)
-
-                return data["person"]
-
-            ident = person_string.replace(" ","").replace(",","").replace(".","")
-            data = {"person":ident,"type":"person","alias":[person_string]}
-            bibserver.dao.Record.upsert(data)
-            return ident
-
-        except:
-            return []
+def findformat(filename):
+    if filename.endswith(".json"): return "json"
+    if filename.endswith(".bibtex"): return "bibtex"
+    if filename.endswith(".bib"): return "bibtex"
+    if filename.endswith(".csv"): return "csv"
+    return "bibtex"
 

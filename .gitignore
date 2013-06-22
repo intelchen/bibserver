@@ -4,3 +4,11 @@ store/*
 .*.swp
 sandbox/*
 src*
+.DS_Store
+.Python
+doc/_build/*
+download_cache/*
+bibjson_cache/*
+local_config.json
+bin/*
+ingest.pid

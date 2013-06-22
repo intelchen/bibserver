@@ -1,3 +1,4 @@
+import os
 import json
 
 '''read the config.json file and make available as a config dict'''
@@ -18,7 +19,14 @@ def load_config(path):
 
     return out
 
-config = load_config('config.json')
+here = os.path.dirname(__file__)
+parent = os.path.dirname(here)
+config_path = os.path.join(parent, 'config.json')
+config = load_config(config_path)
+
+if os.path.exists(os.path.join(parent, 'local_config.json')):
+    local_config = load_config(os.path.join(parent, 'local_config.json'))
+    config.update(local_config)
 
 __all__ = ['config']
 

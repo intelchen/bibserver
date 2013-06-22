@@ -1,23 +1,28 @@
 import os
-from datetime import datetime
 import urllib2
-from copy import deepcopy
 import unicodedata
+import httplib
+import json
+import subprocess
+from copy import deepcopy
+from datetime import datetime
 
 from flask import Flask, jsonify, json, request, redirect, abort, make_response
-from flask import render_template
+from flask import render_template, flash
 from flask.views import View, MethodView
-from flaskext.login import login_user, current_user
+from flask.ext.login import login_user, current_user
 
 import bibserver.dao
-from bibserver.config import config
-import bibserver.iomanager
+import bibserver.util as util
 import bibserver.importer
+import bibserver.ingest
+from bibserver.config import config
 from bibserver.core import app, login_manager
 from bibserver.view.account import blueprint as account
+from bibserver import auth
+
 
 app.register_blueprint(account, url_prefix='/account')
-
 
 # NB: the decorator appears to kill the function for normal usage
 @login_manager.user_loader
@@ -30,193 +35,259 @@ def set_current_user():
     """ Set some template context globals. """
     return dict(current_user=current_user)
 
+@app.before_request
+def standard_authentication():
+    """Check remote_user on a per-request basis."""
+    remote_user = request.headers.get('REMOTE_USER', '')
+    if remote_user:
+        user = bibserver.dao.Account.get(remote_user)
+        if user:
+            login_user(user, remember=False)
+    # add a check for provision of api key
+    elif 'api_key' in request.values:
+        res = bibserver.dao.Account.query(q='api_key:"' + request.values['api_key'] + '"')['hits']['hits']
+        if len(res) == 1:
+            user = bibserver.dao.Account.get(res[0]['_source']['_id'])
+            if user:
+                login_user(user, remember=False)
+
+
+@app.route('/query/<path:path>', methods=['GET','POST'])
+@app.route('/query/', methods=['GET','POST'])
+@app.route('/query', methods=['GET','POST'])
+def query(path='Record'):
+    pathparts = path.split('/')
+    subpath = pathparts[0]
+    if subpath.lower() == 'account':
+        abort(401)
+    klass = getattr(bibserver.dao, subpath[0].capitalize() + subpath[1:] )
+    qs = request.query_string
+    if request.method == "POST":
+        qs += "&source=" + json.dumps(dict(request.form).keys()[-1])
+    if len(pathparts) > 1 and pathparts[1] == '_mapping':
+        resp = make_response( json.dumps(klass().get_mapping()) )
+    else:
+        resp = make_response( klass().raw_query(qs) )
+    resp.mimetype = "application/json"
+    return resp
+        
+@app.route('/faq')
+def content():
+    return render_template('home/faq.html')
+
 
 @app.route('/')
 def home():
-    # get list of available collections
+    data = []
     try:
-        result = bibserver.dao.Record.query(q="type.exact:collection",sort={"received.exact":{"order":"desc"}})
-        if result["hits"]["total"] != 0:
-            colls = [i["_source"]["collection"] for i in result["hits"]["hits"]]
+        colldata = bibserver.dao.Collection.query(sort={"_created.exact":{"order":"desc"}},size=20)
+        if colldata['hits']['total'] != 0:
+            for coll in colldata['hits']['hits']:
+                colln = bibserver.dao.Collection.get(coll['_id'])
+                if colln:
+                    data.append({
+                        'name': colln['label'], 
+                        'records': len(colln), 
+                        'owner': colln['owner'], 
+                        'slug': colln['collection'],
+                        'description': colln['description']
+                    })
     except:
-        colls = None
-    return render_template('home/index.html', colls=colls, upload=config["allow_upload"] )
+        pass
+    colls = bibserver.dao.Collection.query()['hits']['total']
+    records = bibserver.dao.Record.query()['hits']['total']
+    users = bibserver.dao.Account.query()['hits']['total']
+    print data
+    return render_template('home/index.html', colldata=json.dumps(data), colls=colls, records=records, users=users)
 
 
-@app.route('/content/<path:path>')
-def content(path):
-    return render_template('home/content.html', page=path)
-
-
-@app.route('/collection/<collid>/<path:path>')
-def record(collid,path):
-    JSON = False
-    if path.endswith(".json") or path.endswith(".bibjson"):
-        path = path.replace(".bibjson","").replace(".json","")
-        JSON = True
-
-    res = bibserver.dao.Record.query(q='collection:"' + collid + '" AND citekey:"' + path + '"')
-    if res["hits"]["total"] == 0:
-        abort(404)
-    if res["hits"]["total"] > 1:
-        return render_template('record.html', msg="hmmm... there is more than one record in this collection with that id...")
-    recorddict = res["hits"]["hits"][0]["_source"]
-    
-    if JSON:
-        resp = make_response( json.dumps( recorddict, indent=4 ) )
+@app.route('/users')
+@app.route('/users.json')
+def users():
+    if current_user.is_anonymous():
+        abort(401)
+    users = bibserver.dao.Account.query(sort={'_id':{'order':'asc'}},size=1000000)
+    if users['hits']['total'] != 0:
+        accs = [bibserver.dao.Account.get(i['_source']['_id']) for i in users['hits']['hits']]
+        # explicitly mapped to ensure no leakage of sensitive data. augment as necessary
+        users = []
+        for acc in accs:
+            user = {"collections":len(acc.collections),"_id":acc["_id"]}
+            try:
+                user['_created'] = acc['_created']
+                user['description'] = acc['description']
+            except:
+                pass
+            users.append(user)
+    if util.request_wants_json():
+        resp = make_response( json.dumps(users, sort_keys=True, indent=4) )
         resp.mimetype = "application/json"
         return resp
-
-    return render_template('record.html', record=recorddict)
-
-
-@app.route('/query', methods=['GET', 'POST'])
-def query():
-    resp = make_response( bibserver.dao.Record.raw_query(request.query_string) )
-    resp.mimetype = "application/json"
-    return resp
-
-
+    else:
+        return render_template('account/users.html',users=users)
+    
+# handle or disable uploads
 class UploadView(MethodView):
-    '''The upload view.
-
-    upload from URL provided in source, or from file upload button, or from
-    POST default format is bibtex, but accept other format specifications via
-    format default upload is a collection, but could also be person or group
-    record
-    '''
     def get(self):
+        if not auth.collection.create(current_user, None):
+            flash('You need to login to upload a collection.')
+            return redirect('/account/login')
         if request.values.get("source") is not None:
-            return self.post()
-        return render_template('upload.html')
+            return self.post()        
+        return render_template('upload.html',
+                               parser_plugins=bibserver.ingest.get_plugins().values())
 
     def post(self):
-        pkg = self.package()
-        if self.validate(pkg):
-            importer = bibserver.importer.Importer()
-#            try:
-            res = importer.upload(pkg)
-            if res != "DUPLICATE":
-                if "collection" in pkg:
-                    return redirect('/collection/' + pkg["collection"])
-                msg = "Your records were uploaded but no collection name could be discerned."
-            elif res == "DUPLICATE":
-                msg = "The collection name you specified is already in use."
-                msg += "<br />Please use another collection name."
+        if not auth.collection.create(current_user, None):
+            abort(401)
+        try:
+            if not request.values.get('collection',None):
+                flash('You need to provide a collection name.')
+                return redirect('/upload')
+            if not request.values.get('source',None):
+                if not request.files.get('upfile',None):
+                    if not request.json:
+                        flash('You need to provide a source URL or an upload file.')
+                        return redirect('/upload')
+                
+            collection = request.values.get('collection')
+            format=request.values.get('format')
+            if request.files.get('upfile'):
+                fileobj = request.files.get('upfile')
+                if not format:
+                    format = bibserver.importer.findformat(fileobj.filename)
             else:
-                msg = "Sorry! There was an indexing error. Please try again."                    
-#            except:
-#                msg = 'Sorry! There was an error indexing your collection. Please try again.'
+                if not format:
+                    format = bibserver.importer.findformat( request.values.get("source").strip('"') )
+            
+            ticket = bibserver.ingest.IngestTicket(owner=current_user.id, 
+                                       source_url=request.values.get("source"),
+                                       format=format,
+                                       collection=request.values.get('collection'),
+                                       description=request.values.get('description'),
+                                       )
+            # Allow only parsing
+            only_parse = request.values.get('only_parse')
+            if only_parse:
+               ticket['only_parse'] = True
+            
+            license = request.values.get('license')
+            if license: ticket['license'] = license
+            
+            # If the user is uploading a file, update the ticket with the 'downloaded' file
+            # And correct source
+            if request.files.get('upfile'):
+                data = fileobj.read()
+                ticket['data_md5'] = bibserver.ingest.store_data_in_cache(data)
+                ticket['source_url'] = config.get('SITE_URL','') + '/ticket/%s/data' % ticket.id
+                ticket['state'] = 'downloaded'
+            
+            # if user is sending JSON, update the ticket with the received JSON
+            if request.json:
+                data = request.json
+                ticket['data_md5'] = bibserver.ingest.store_data_in_cache(json.dumps(data))
+                ticket['source_url'] = config.get('SITE_URL','') + '/ticket/%s/data' % ticket.id
+                ticket['state'] = 'downloaded'
+
+            ticket.save()
+            
+        except Exception, inst:
+            msg = str(inst)
+            if app.debug or app.config['TESTING']:
+                raise
+            flash('error: ' + msg)
+            return render_template('upload.html')
         else:
-            msg = 'Your upload failed to validate. Please try again.'
-        return render_template('upload.html', msg=msg)
+            return redirect('/ticket/'+ticket.id)
 
-    def validate(self, pkg):
-        '''validate the submission before proceeding'''
-        if "source" in pkg or "upfile" in pkg or "data" in pkg:
-            return True
-        return False
-    
-    def package(self):
-        '''make package with: 
-            format of upload (default to bibtex)
-            collection name (default to version of filename)
-            email address (for a file upload)
-            source, upfile, or data, depending on if URL, upload, or POST
-            date received
-        '''
-        pkg = dict()
+# handle or disable uploads
+class CreateView(MethodView):
+    def get(self):
+        if not auth.collection.create(current_user, None):
+            flash('You need to login to create a collection.')
+            return redirect('/account/login')
+        if request.values.get("source") is not None:
+            return self.post()        
+        return render_template('create.html')
 
-        if request.values.get("source"):
-            pkg["source"] = urllib2.unquote(request.values.get("source"))
-        if request.files.get('upfile'):
-            pkg["upfile"] = request.files.get('upfile')
-        if request.values.get('data'):
-            pkg["data"] = request.values['data']
+    def post(self):
+        if not auth.collection.create(current_user, None):
+            abort(401)
 
-        if request.values.get("collection"):
-            pkg["collection"] = request.values.get("collection")
-        pkg["format"] = request.values.get('format', 'bibtex')
-        pkg["email"] = request.values.get("email", None)
+        # create the new collection for current user
+        coll = {
+            'label' : request.values.get('collection'),
+            'license' : request.values.get('license')
+        }
+        i = bibserver.importer.Importer(current_user)
+        collection, records = i.index(coll, {})
+        return redirect(collection['owner'] + '/' + collection['collection'])
 
-        pkg["received"] = str(datetime.now())
+# a class for use when upload / create are disabled
+class NoUploadOrCreate(MethodView):
+    def get(self):
+        return render_template('disabled.html')
 
-        return pkg
+    def post(self):
+        abort(401)    
 
-# enable upload unless not allowed in config
-if config["allow_upload"] == "YES":
+# set the upload / create views as appropriate
+if config["allow_upload"]:
     app.add_url_rule('/upload', view_func=UploadView.as_view('upload'))
+    app.add_url_rule('/create', view_func=CreateView.as_view('create'))
+else:
+    app.add_url_rule('/upload', view_func=NoUploadOrCreate.as_view('upload'))
+    app.add_url_rule('/create', view_func=NoUploadOrCreate.as_view('create'))
 
 
-@app.route('/search')
-@app.route('/<path:path>')
-def search(path=''):
+# set the route for receiving new notes
+@app.route('/note', methods=['GET','POST'])
+@app.route('/note/<nid>', methods=['GET','POST','DELETE'])
+def note(nid=''):
+    if current_user.is_anonymous():
+        abort(401)
 
-    JSON = False
-    if path.endswith(".json") or path.endswith(".bibjson"):
-        path = path.replace(".bibjson","").replace(".json","")
-        JSON = True
+    elif request.method == 'POST':
+        newnote = bibserver.dao.Note()
+        newnote.data = request.json
+        newnote.save()
+        return redirect('/note/' + newnote.id)
 
-    # read args from config and params    
-    args = {"terms":{},"facet_fields" : [i + config["facet_field"] for i in config["facet_fields"]]}
-    if 'from' in request.values:
-        args['start'] = request.values.get('from')
-    if 'size' in request.values:
-        args['size'] = request.values.get('size')
-    if 'sort' in request.values:
-        if request.values.get("sort") != "..." and request.values.get("sort") != "":
-            args['sort'] = {request.values.get('sort')+config["facet_field"] : {"order" : request.values.get('order','asc')}}
-    if 'q' in request.values:
-        if len(request.values.get('q')) > 0:
-            args['q'] = request.values.get('q')
-    for param in request.values:
-        if param in config["facet_fields"]:
-            vals = json.loads(unicodedata.normalize('NFKD',urllib2.unquote(request.values.get(param))).encode('utf-8','ignore'))
-            args["terms"][param + config["facet_field"]] = vals
-    
-    # get implicit facet
-    c = {'implicit_facet': {}}
-    if path != '' and "search" not in path:
-        path = path.strip()
-        if path.endswith("/"):
-            path = path[:-1]
-        bits = path.split('/')
-        if len(bits) == 2:
-            # its an implicit facet
-            args['terms'][bits[0]+config["facet_field"]] = [bits[1]]
-            c['implicit_facet'][bits[0]] = bits[1]
-        elif len(bits) == 1:
-            # send request through as an implicit facet on type, if said type exists
-            qry = 'type' + config["facet_field"] + ':' + bits[0]
-            check = bibserver.dao.Record.query(q=qry,size=1)
-            if check["hits"]["total"] != 0:
-                c['implicit_facet']["type"] = bits[0]
-                args['terms']["type"+config["facet_field"]] = [bits[0]]
-            else:
-                # otherwise just show a listing of the facet values for that key
-                if 'q' in args:
-                    qryval = args['q']
-                else:
-                    qryval = "*:*"
-                result = bibserver.dao.Record.query(q=qryval,facet_fields=[bits[0]+config["facet_field"]])
-                vals = result["facets"][bits[0]+config["facet_field"]]["terms"]
-                #return render_template('search/listing.html', vals=vals)
-        
+    elif request.method == 'DELETE':
+        note = bibserver.dao.Note.get(nid)
+        note.delete()
+        return redirect('/note')
 
-    # get results and render
-    results = bibserver.dao.Record.query(**args)
-    args['path'] = path
-    c['io'] = bibserver.iomanager.IOManager(results, args)
+    else:
+        thenote = bibserver.dao.Note.get(nid)
+        if thenote:
+            resp = make_response( json.dumps(thenote.data, sort_keys=True, indent=4) )
+            resp.mimetype = "application/json"
+            return resp
+        else:
+            abort(404)
 
-    if JSON:
-        resp = make_response( json.dumps(c['io'].set(), indent=4 ) )
-        resp.mimetype = "application/json"
-        return resp
 
-    return render_template('search/index.html', c=c)
+# this is a catch-all that allows us to present everything as a search
+# typical catches are /user, /user/collection, /user/collection/record, 
+# /implicit_facet_key/implicit_facet_value
+# and any thing else passed as a search
+@app.route('/<path:path>', methods=['GET','POST','DELETE'])
+def default(path):
+    import bibserver.search
+    searcher = bibserver.search.Search(path=path,current_user=current_user)
+    return searcher.find()
 
 
 if __name__ == "__main__":
-    bibserver.dao.init_db()
-    app.run(host='0.0.0.0', debug=True)
-
+    if config["allow_upload"]:
+        bibserver.ingest.init()
+        if not os.path.exists('ingest.pid'):
+            ingest=subprocess.Popen(['python', 'bibserver/ingest.py'])
+            open('ingest.pid', 'w').write('%s' % ingest.pid)
+    try:
+        bibserver.dao.init_db()
+        app.run(host='0.0.0.0', debug=config['debug'], port=config['port'])
+    finally:
+        if os.path.exists('ingest.pid'):
+            os.remove('ingest.pid')

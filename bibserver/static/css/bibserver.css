@@ -1,0 +1,36 @@
+body {
+    padding-top: 40px;
+}
+
+.content {
+    margin-top: 20px;
+}
+
+form{
+    display:inline;
+}
+
+footer {
+    border-top:2px solid #ccc;
+    margin-top:50px;
+    padding-top:30px;
+}
+
+div.alert-messages {
+    margin-top: 15px;
+}
+
+span.upload_label{
+    width:150px;
+    display:block;
+    float:left;
+    padding:5px 10px 0 0;
+    text-align:right;
+}
+
+#adminarea{
+    display:none;
+}
+#shareembeddets{
+    display:none;
+}

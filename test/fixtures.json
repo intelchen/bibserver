@@ -1,22 +1,32 @@
 {
+  "accounts": [
+    {
+      "_id": "tester",
+      "fullname": "The Tester",
+      "email": "tester@okfn.org",
+      "password_raw": "pass"
+    }
+  ],
   "records": [
     {
-      "citekey":"some ID",
+      "id":"someID",
       "type": "book",
       "title":"Great Unwritten Collaborations",
-      "author": ["Leo Tolstoy","Robert Musil"],
-      "journal": "journal_name",
-      "collection": ["great-novels"],
-      "person": ["leo.tolstoy","robert.musil"],
+      "author": [{"name":"Leo Tolstoy"},{"name":"Robert Musil"}],
+      "journal": {"name":"journal_name"},
+      "collection": "great_novels",
       "moreinfo":"some more information about this collection",
+      "owner": "tester",
       "ns1:thing":"some thing"
     },
     {
       "type": "article",
       "title":"A mathematical theory of communication",
-      "author": ["Claude Shannon"],
-      "journal": "Bell System Technical Journal",
-      "collection": ["information-theory"]
+      "author": [{"name":"Claude Shannon"}],
+      "journal": {"name":"Bell System Technical Journal"},
+      "id": "otherid",
+      "owner": "tester",
+      "collection": "information_theory"
     }
   ]
 }

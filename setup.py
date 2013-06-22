@@ -2,16 +2,16 @@ from setuptools import setup, find_packages
 
 setup(
     name = 'bibserver',
-    version = '0.3',
+    version = '0.5.1',
     packages = find_packages(),
     install_requires = [
-        "Flask==0.7.2",
+        "Flask==0.8",
         "Flask-Login",
         "Flask-WTF",
         "pyes==0.16",
-        # need solrpy from HEAD. See README.rst.
-        "solrpy",
-        ],
+        "chardet",
+        "requests",
+    ],
     url = 'http://bibserver.okfn.org/',
     author = 'Open Knowledge Foundation',
     author_email = 'openbiblio@okfn.org',
